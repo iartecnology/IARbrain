@@ -28,6 +28,23 @@ agy  (Antigravity CLI, sesion OAuth en AGY_HOME)
 - **Metricas** Prometheus en `/metrics` y **health** en `/health` (con chequeos de `agy`, del home de `agy` y de auth reciente).
 - **Alertas** opcionales por Telegram cuando `agy` pierde la sesion o agota cuota.
 
+## Modelos
+
+Un solo puerto (11444) y varios modelos. El campo `model` elige el motor:
+
+| Modelo | Motor | Memoria | Tools |
+|---|---|---|---|
+| `antigravity-session` | Antigravity (`agy`) | `/chat` con `conversation_id`; OpenAI sin memoria | Si (tool calling emulado) |
+| `opencode/big-pickle` | OpenCode 2.2.6 (modelo gratuito de OpenCode Zen, sin API key) | `/chat` con `conversation_id` (sesion `ses_...`); OpenAI sin memoria | No (400) |
+
+OpenCode corre como usuario sin privilegios (`10001`), con entorno vacio (no hereda el token del puente) y con
+`bash`, `edit`, `write` y `webfetch` denegados. Sus datos viven en el volumen `opencode-data`.
+
+Limitaciones de OpenCode:
+- El modelo gratuito tiene cuota. Al agotarla responde `429 opencode_quota` con `Retry-After`.
+- `read` sigue permitido: puede leer archivos legibles para el usuario `10001` dentro del contenedor (no secretos del puente).
+- Mensajes de mas de `OPENCODE_MAX_CHARS` se rechazan con 413.
+
 ## Chat con memoria (como el chat de agy)
 
 `POST /chat` mantiene conversaciones reales de `agy`: el id lo asigna `agy` y cada turno
