@@ -1,0 +1,288 @@
+"""Pruebas del puente con un agy falso. Ejecutar: python3 -m unittest discover -s tests -v"""
+import json
+import os
+import socketserver
+import stat
+import sys
+import tempfile
+import threading
+import time
+import unittest
+import urllib.error
+import urllib.request
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+import server  # noqa: E402
+
+FAKE_AGY = r'''#!/usr/bin/env python3
+import json, os, sys, time
+mode = os.environ.get("FAKE_AGY_MODE", "answer")
+line = sys.stdin.readline()
+if "--json-schema" not in sys.argv and mode not in ("text", "noresult", "hang", "auth", "quota"):
+    pass
+def emit(result):
+    print(json.dumps({"event": "result", "result": result}), flush=True)
+usage = {"input_tokens": 11, "output_tokens": 7, "total_tokens": 18}
+if mode == "hang":
+    time.sleep(60)
+elif mode == "noresult":
+    sys.stderr.write("boom\n"); sys.exit(1)
+elif mode == "auth":
+    emit({"status": "ERROR", "error": "OAuth token expired, please login again", "usage": usage})
+elif mode == "quota":
+    emit({"status": "ERROR", "error": "You have exhausted your quota on this model.", "usage": usage})
+elif mode == "text":
+    emit({"status": "SUCCESS", "response": "texto libre", "usage": usage})
+elif mode == "tool":
+    emit({"status": "SUCCESS", "response": "", "usage": usage,
+          "structured_output": {"action": "tool_call", "tool": "get_account", "arguments": {"id": "abc"}}})
+elif mode == "badargs":
+    emit({"status": "SUCCESS", "response": "", "usage": usage,
+          "structured_output": {"action": "tool_call", "tool": "get_account", "arguments": {}}})
+elif mode == "retry":
+    counter = os.environ["FAKE_AGY_COUNTER"]
+    n = int(open(counter).read()) if os.path.exists(counter) else 0
+    open(counter, "w").write(str(n + 1))
+    if n == 0:
+        emit({"status": "SUCCESS", "response": "", "usage": usage,
+              "structured_output": {"action": "tool_call", "tool": "nope", "arguments": {}}})
+    else:
+        emit({"status": "SUCCESS", "response": "", "usage": usage,
+              "structured_output": {"action": "answer", "content": "listo"}})
+else:
+    emit({"status": "SUCCESS", "response": "hola", "usage": usage,
+          "structured_output": {"action": "answer", "content": "hola"}})
+'''
+
+TOOLS = [{"type": "function", "function": {
+    "name": "get_account", "description": "cuenta",
+    "parameters": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}}}]
+
+
+class BridgeTest(unittest.TestCase):
+    token = "test-token"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tempfile.mkdtemp()
+        cls.agy = os.path.join(cls.dir, "agy")
+        with open(cls.agy, "w") as fh:
+            fh.write(FAKE_AGY)
+        os.chmod(cls.agy, os.stat(cls.agy).st_mode | stat.S_IEXEC)
+        server.CONFIG.update({
+            "agy_bin": cls.agy, "bridge_token": cls.token, "agy_timeout": 3,
+            "max_concurrency": 2, "decision_retries": 1, "retention_days": 0,
+            "agy_home": cls.dir, "state_dir": cls.dir, "log_format": "text",
+            "max_prompt_chars": 300000, "telegram_token": None, "telegram_chat_id": None,
+        })
+        server.GATE = threading.BoundedSemaphore(server.CONFIG["max_concurrency"])
+        cls.httpd = socketserver.ThreadingTCPServer(("127.0.0.1", 0), server.BridgeHandler)
+        cls.httpd.daemon_threads = True
+        cls.port = cls.httpd.server_address[1]
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def setUp(self):
+        os.environ["FAKE_AGY_MODE"] = "answer"
+        counter = os.path.join(self.dir, "counter")
+        if os.path.exists(counter):
+            os.remove(counter)
+        os.environ["FAKE_AGY_COUNTER"] = counter
+        server.CONFIG["agy_timeout"] = 3
+        server.CONFIG["decision_retries"] = 1
+        server.GATE = threading.BoundedSemaphore(server.CONFIG["max_concurrency"])
+
+    def request(self, path, body=None, token=None, method=None):
+        url = "http://127.0.0.1:%d%s" % (self.port, path)
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method or ("POST" if data else "GET"))
+        req.add_header("Content-Type", "application/json")
+        if token is not None:
+            req.add_header("Authorization", "Bearer " + token)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                raw = resp.read().decode("utf-8")
+                ctype = resp.headers.get("Content-Type", "")
+                return resp.status, (json.loads(raw) if "json" in ctype else raw), resp.headers
+        except urllib.error.HTTPError as err:
+            raw = err.read().decode("utf-8")
+            try:
+                return err.code, json.loads(raw), err.headers
+            except ValueError:
+                return err.code, raw, err.headers
+
+    def chat(self, **extra):
+        body = {"model": "antigravity-session", "messages": [{"role": "user", "content": "hola"}]}
+        body.update(extra)
+        return self.request("/v1/chat/completions", body, token=self.token)
+
+    # auth
+    def test_rejects_missing_token(self):
+        status, body, _ = self.request("/v1/chat/completions",
+                                       {"messages": [{"role": "user", "content": "x"}]})
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"]["type"], "unauthorized")
+
+    def test_rejects_wrong_token(self):
+        status, _, _ = self.request("/api/tags", token="nope")
+        self.assertEqual(status, 401)
+
+    def test_health_and_metrics_are_public(self):
+        status, body, _ = self.request("/health")
+        self.assertIn(status, (200, 503))
+        self.assertIn("checks", body)
+        status, text, _ = self.request("/metrics")
+        self.assertEqual(status, 200)
+        self.assertIn("bridge_http_requests_total", text)
+
+    # texto libre
+    def test_plain_answer(self):
+        status, body, _ = self.chat()
+        self.assertEqual(status, 200)
+        self.assertEqual(body["choices"][0]["message"]["content"], "hola")
+        self.assertEqual(body["choices"][0]["finish_reason"], "stop")
+
+    def test_text_mode_without_schema(self):
+        os.environ["FAKE_AGY_MODE"] = "text"
+        status, body, _ = self.chat()
+        self.assertEqual(body["choices"][0]["message"]["content"], "texto libre")
+
+    # tool calling
+    def test_valid_tool_call(self):
+        os.environ["FAKE_AGY_MODE"] = "tool"
+        status, body, _ = self.chat(tools=TOOLS)
+        self.assertEqual(status, 200)
+        choice = body["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        call = choice["message"]["tool_calls"][0]
+        self.assertEqual(call["function"]["name"], "get_account")
+        self.assertEqual(json.loads(call["function"]["arguments"]), {"id": "abc"})
+
+    def test_invalid_args_fail_after_retries(self):
+        os.environ["FAKE_AGY_MODE"] = "badargs"
+        status, body, _ = self.chat(tools=TOOLS)
+        self.assertEqual(status, 502)
+        self.assertEqual(body["error"]["type"], "invalid_decision")
+
+    def test_unknown_tool_is_retried_then_accepted(self):
+        os.environ["FAKE_AGY_MODE"] = "retry"
+        status, body, _ = self.chat(tools=TOOLS)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["choices"][0]["message"]["content"], "listo")
+
+    def test_streaming_tool_call(self):
+        os.environ["FAKE_AGY_MODE"] = "tool"
+        url = "http://127.0.0.1:%d/v1/chat/completions" % self.port
+        body = {"messages": [{"role": "user", "content": "x"}], "tools": TOOLS, "stream": True}
+        req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Authorization", "Bearer " + self.token)
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            text = resp.read().decode("utf-8")
+        self.assertIn('"tool_calls"', text)
+        self.assertIn("[DONE]", text)
+
+    # errores
+    def test_auth_error_maps_to_503(self):
+        os.environ["FAKE_AGY_MODE"] = "auth"
+        status, body, _ = self.chat()
+        self.assertEqual(status, 503)
+        self.assertEqual(body["error"]["type"], "agy_auth")
+
+    def test_quota_error_maps_to_429(self):
+        os.environ["FAKE_AGY_MODE"] = "quota"
+        status, body, headers = self.chat()
+        self.assertEqual(status, 429)
+        self.assertEqual(body["error"]["type"], "agy_quota")
+        self.assertEqual(headers.get("Retry-After"), "60")
+
+    def test_no_result_maps_to_502(self):
+        os.environ["FAKE_AGY_MODE"] = "noresult"
+        status, body, _ = self.chat()
+        self.assertEqual(status, 502)
+        self.assertEqual(body["error"]["type"], "agy_error")
+
+    def test_timeout_maps_to_504(self):
+        os.environ["FAKE_AGY_MODE"] = "hang"
+        server.CONFIG["agy_timeout"] = 2
+        started = time.time()
+        status, body, _ = self.chat()
+        self.assertEqual(status, 504)
+        self.assertEqual(body["error"]["type"], "agy_timeout")
+        self.assertLess(time.time() - started, 20)
+
+    def test_prompt_too_large_maps_to_413(self):
+        server.CONFIG["max_prompt_chars"] = 100
+        try:
+            status, body, _ = self.request("/v1/chat/completions",
+                                           {"messages": [{"role": "user", "content": "x" * 500}]},
+                                           token=self.token)
+        finally:
+            server.CONFIG["max_prompt_chars"] = 300000
+        self.assertEqual(status, 413)
+        self.assertEqual(body["error"]["type"], "prompt_too_large")
+
+    def test_invalid_json_maps_to_400(self):
+        req = urllib.request.Request("http://127.0.0.1:%d/v1/chat/completions" % self.port,
+                                     data=b"{nope", method="POST")
+        req.add_header("Authorization", "Bearer " + self.token)
+        try:
+            urllib.request.urlopen(req, timeout=10)
+            self.fail("expected 400")
+        except urllib.error.HTTPError as err:
+            self.assertEqual(err.code, 400)
+
+    def test_busy_returns_429_with_retry_after(self):
+        os.environ["FAKE_AGY_MODE"] = "hang"
+        server.CONFIG["agy_timeout"] = 4
+        server.GATE = threading.BoundedSemaphore(1)
+        server.GATE.acquire()
+        try:
+            status, body, headers = self.chat()
+        finally:
+            server.GATE.release()
+        self.assertEqual(status, 429)
+        self.assertEqual(body["error"]["type"], "busy")
+        self.assertEqual(headers.get("Retry-After"), "5")
+
+    def test_ollama_chat(self):
+        status, body, _ = self.request("/api/chat",
+                                       {"messages": [{"role": "user", "content": "hola"}]},
+                                       token=self.token)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["message"]["content"], "hola")
+
+    def test_unknown_endpoint_404(self):
+        status, _, _ = self.request("/responses", {"x": 1}, token=self.token)
+        self.assertEqual(status, 404)
+
+
+class ValidateTest(unittest.TestCase):
+    schema = {"type": "object", "properties": {"id": {"type": "string"}, "qty": {"type": "integer"},
+                                              "side": {"type": "string", "enum": ["buy", "sell"]}},
+              "required": ["id"]}
+
+    def test_ok(self):
+        self.assertIsNone(server.validate_arguments({"id": "a", "qty": 2, "side": "buy"}, self.schema))
+
+    def test_missing_required(self):
+        self.assertIn("requerido", server.validate_arguments({}, self.schema))
+
+    def test_wrong_type(self):
+        self.assertIn("integer", server.validate_arguments({"id": "a", "qty": "2"}, self.schema))
+
+    def test_bool_is_not_integer(self):
+        self.assertIn("integer", server.validate_arguments({"id": "a", "qty": True}, self.schema))
+
+    def test_enum(self):
+        self.assertIn("permitidos", server.validate_arguments({"id": "a", "side": "hold"}, self.schema))
+
+
+if __name__ == "__main__":
+    unittest.main()

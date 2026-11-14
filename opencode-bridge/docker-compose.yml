@@ -1,0 +1,28 @@
+services:
+  bridge:
+    build: .
+    image: opencode-bridge:0.2.0
+    container_name: opencode-cli
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      # Por defecto publica en todas las interfaces, protegido por BRIDGE_TOKEN.
+      # Para restringir a la red del host usar BRIDGE_PUBLISH=127.0.0.1:11444:11444 en .env.
+      - "${BRIDGE_PUBLISH:-11444:11444}"
+    volumes:
+      - agy-home:/root/.gemini
+      - bridge-state:/state
+    tmpfs:
+      - /tmp
+      - /root/.cache
+    # Evita que el autoupdater de agy reemplace el binario dentro del contenedor.
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    mem_limit: 2g
+    stop_grace_period: 30s
+
+volumes:
+  agy-home:
+  bridge-state:
