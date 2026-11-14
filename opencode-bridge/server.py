@@ -18,6 +18,7 @@ import hmac
 import http.server
 import json
 import os
+import re
 import select
 import shutil
 import signal
@@ -61,6 +62,7 @@ CONFIG = {
     "max_prompt_chars": _env_int("MAX_PROMPT_CHARS", 300000),
     "decision_retries": max(0, _env_int("DECISION_RETRIES", 1)),
     "skip_permissions": _env_bool("AGY_SKIP_PERMISSIONS", True),
+    "chat_mode": os.environ.get("CHAT_MODE", "plan"),
     "retention_days": _env_int("AGY_RETENTION_DAYS", 7),
     "dump_requests": _env_bool("DEBUG_DUMP_REQUESTS", False),
     "state_dir": os.environ.get("STATE_DIR", "/state"),
@@ -351,6 +353,184 @@ def call_agy(prompt, schema=None, request_id="-", keepalive=None, cancelled=None
     }
 
 
+CONV_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+INDEX_LOCK = threading.Lock()
+CONV_LOCKS = {}
+
+
+def _now():
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def index_path():
+    return os.path.join(CONFIG["state_dir"], "conversations.json")
+
+
+def index_load():
+    try:
+        with open(index_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _index_save(data):
+    os.makedirs(CONFIG["state_dir"], exist_ok=True)
+    tmp = index_path() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False)
+    os.replace(tmp, index_path())
+
+
+def index_touch(cid):
+    with INDEX_LOCK:
+        data = index_load()
+        entry = data.get(cid) or {"id": cid, "created": _now(), "turns": 0}
+        entry["last_used"] = _now()
+        entry["turns"] = int(entry.get("turns", 0)) + 1
+        data[cid] = entry
+        _index_save(data)
+
+
+def index_remove(cid):
+    with INDEX_LOCK:
+        data = index_load()
+        if cid not in data:
+            return False
+        del data[cid]
+        _index_save(data)
+        return True
+
+
+def run_chat_turn(message, conversation_id, request_id, on_init, on_delta, cancelled, keepalive=None):
+    """Un turno de chat con agy, como en su chat interactivo. Mantiene la memoria con --conversation.
+
+    on_init(cid) se llama al conocer el id de conversacion; on_delta(text) por cada fragmento de texto.
+    Ninguna escritura de cliente puede tumbar el turno: si on_delta falla, se cancela agy.
+    """
+    cmd = [CONFIG["agy_bin"], "--print", "", "--input-format", "stream-json", "--output-format", "stream-json"]
+    if conversation_id:
+        cmd += ["--conversation", conversation_id]
+    if CONFIG["chat_mode"] == "plan":
+        cmd += ["--mode", "plan"]
+
+    started = time.time()
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                                errors="replace", start_new_session=True)
+    except OSError as exc:
+        METRICS.count(METRICS.agy, "unavailable")
+        raise BridgeError(503, "agy_unavailable", "no se pudo ejecutar agy: %s" % exc)
+
+    try:
+        proc.stdin.write(json.dumps({"event": "user", "message": {"role": "user", "content": message}}) + "\n")
+        proc.stdin.close()
+    except OSError:
+        pass
+
+    state = {"cid": conversation_id, "result": None, "init_sent": False, "gone": False}
+
+    def send_init(cid):
+        if cid and not state["init_sent"]:
+            state["init_sent"] = True
+            on_init(cid)
+
+    def reader():
+        for raw in proc.stdout:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                event = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            kind = event.get("event")
+            if kind == "init" and not state["cid"]:
+                state["cid"] = event.get("conversation_id")
+                send_init(state["cid"])
+            elif kind == "step_update":
+                step = event.get("step_update") or {}
+                text = step.get("text_delta")
+                if step.get("step_type") == "agent_response" and text and on_delta and not state["gone"]:
+                    try:
+                        on_delta(text)
+                    except Exception:  # noqa: BLE001
+                        state["gone"] = True
+            elif kind == "result":
+                state["result"] = event.get("result") or {}
+                state["cid"] = state["cid"] or state["result"].get("conversation_id")
+
+    send_init(conversation_id)
+    err_lines = []
+    err_thread = threading.Thread(target=lambda: err_lines.append(proc.stderr.read()), daemon=True)
+    out_thread = threading.Thread(target=reader, daemon=True)
+    err_thread.start()
+    out_thread.start()
+
+    deadline = started + CONFIG["agy_timeout"]
+    outcome = None
+    last_keepalive = time.time()
+    while True:
+        try:
+            proc.wait(timeout=2)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        if state["gone"] or cancelled():
+            outcome = "cancelled"
+            break
+        if time.time() > deadline:
+            outcome = "timeout"
+            break
+        if keepalive and time.time() - last_keepalive >= 5:
+            last_keepalive = time.time()
+            if not keepalive():
+                outcome = "cancelled"
+                break
+    if outcome:
+        _kill(proc)
+        out_thread.join(5)
+        METRICS.count(METRICS.agy, outcome)
+        log("chat_" + outcome, request_id)
+        if outcome == "timeout":
+            raise BridgeError(504, "agy_timeout", "agy excedio el tiempo de espera.")
+        raise BridgeError(499, "client_closed", "cliente desconectado; turno de chat cancelado.")
+
+    out_thread.join(10)
+    err_thread.join(5)
+    METRICS.observe_agy(time.time() - started)
+    cid = state["cid"]
+    send_init(cid)
+    err = (err_lines[0] if err_lines else "").strip()
+    result = state["result"]
+    if result is None:
+        METRICS.count(METRICS.agy, "no_result")
+        if looks_like_auth_error(err):
+            METRICS.last_auth_error = time.time()
+            raise BridgeError(503, "agy_auth", "agy no tiene sesion valida: %s" % err[:300])
+        raise BridgeError(502, "agy_error", err or "agy no devolvio un resultado")
+
+    status = result.get("status") or "ERROR"
+    error_text = str(result.get("error") or "")
+    METRICS.count(METRICS.agy, status)
+    usage = usage_of(result)
+    METRICS.add_usage(usage)
+    log("chat_done", request_id, status=status, conversation_id=cid, total_tokens=usage["total_tokens"])
+    if status != "SUCCESS":
+        if looks_like_quota_error(error_text):
+            raise BridgeError(429, "agy_quota", "agy: cuota agotada en el modelo.", retry_after=60)
+        if looks_like_auth_error(error_text) or looks_like_auth_error(err):
+            METRICS.last_auth_error = time.time()
+            raise BridgeError(503, "agy_auth", "agy: %s" % (error_text or status))
+        raise BridgeError(502, "agy_error", "agy status=%s: %s" % (status, error_text or err[:300]))
+    return {"conversation_id": cid, "response": (result.get("response") or "").strip(),
+            "usage": usage, "status": status}
+
+
 def content_to_text(content):
     if isinstance(content, str):
         return content
@@ -512,6 +692,7 @@ def prune_agy_state():
     """Borra entradas viejas de conversaciones y logs de agy. Solo con el puente inactivo."""
     cutoff = time.time() - CONFIG["retention_days"] * 86400
     removed = 0
+    keep = list(index_load().keys())
     for sub in ("conversations", "brain", "log"):
         base = os.path.join(CONFIG["agy_home"], sub)
         if not os.path.isdir(base):
@@ -520,6 +701,8 @@ def prune_agy_state():
             path = os.path.join(base, name)
             try:
                 if os.path.getmtime(path) >= cutoff or os.path.islink(path):
+                    continue
+                if any(cid in name for cid in keep):
                     continue
                 if os.path.isdir(path) and not os.path.islink(path):
                     shutil.rmtree(path)
@@ -656,7 +839,10 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(body)
             else:
                 self._authorized()
-                if path == "/api/version":
+                if path == "/chat/conversations":
+                    items = sorted(index_load().values(), key=lambda e: e.get("last_used", ""), reverse=True)
+                    self._json({"conversations": items})
+                elif path == "/api/version":
                     self._json({"version": "0.1.32", "status": "ok", "model": CONFIG["model_name"],
                                 "tool_calling": True})
                 elif path in ("/api/tags", "/api/ps"):
@@ -680,7 +866,8 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
         }
         ok = checks["agy_present"] and checks["agy_home"] and not checks["recent_auth_error"]
         body = {"status": "ok" if ok else "degraded", "version": VERSION, "model": CONFIG["model_name"],
-                "tool_calling": True, "checks": checks, "in_flight": METRICS.in_flight,
+                "tool_calling": True, "chat": {"mode": CONFIG["chat_mode"]},
+                "checks": checks, "in_flight": METRICS.in_flight,
                 "max_concurrency": CONFIG["max_concurrency"]}
         query = self._query()
         if "deep=1" in query:
@@ -692,6 +879,101 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                 body["deep"] = err.code
                 ok = False
         self._json(body, 200 if ok else 503)
+
+    def do_DELETE(self):
+        path = self._path()
+        try:
+            self._authorized()
+            prefix = "/chat/conversations/"
+            if not path.startswith(prefix):
+                raise BridgeError(404, "not_found", "Not Found")
+            cid = path[len(prefix):]
+            if not CONV_ID_RE.match(cid):
+                raise BridgeError(400, "invalid_request", "conversation_id invalido")
+            if not index_remove(cid):
+                raise BridgeError(404, "conversation_not_found", "conversacion no encontrada")
+            self._json({"deleted": cid})
+        except BridgeError as err:
+            self._error(err)
+        finally:
+            self._route_done(path, self.status_sent)
+
+    def _chat(self, payload):
+        message = payload.get("message")
+        if not isinstance(message, str) or not message.strip():
+            raise BridgeError(400, "invalid_request", "message es obligatorio")
+        if message.lstrip().startswith("/"):
+            raise BridgeError(400, "slash_commands_disabled",
+                              "los comandos / no estan permitidos en el chat remoto")
+        self._check_prompt(message)
+        cid = payload.get("conversation_id")
+        lock = None
+        if cid is not None:
+            if not isinstance(cid, str) or not CONV_ID_RE.match(cid):
+                raise BridgeError(400, "invalid_request", "conversation_id invalido")
+            if cid not in index_load():
+                raise BridgeError(404, "conversation_not_found", "conversacion no encontrada")
+            lock = CONV_LOCKS.setdefault(cid, threading.Lock())
+            if not lock.acquire(blocking=False):
+                raise BridgeError(409, "conversation_busy", "la conversacion tiene un turno en curso")
+        try:
+            if payload.get("stream"):
+                self._chat_stream(message, cid)
+            else:
+                result = run_chat_turn(message, cid, self.request_id, lambda c: None, None,
+                                       lambda: client_gone(self.connection))
+                index_touch(result["conversation_id"])
+                self._json({"conversation_id": result["conversation_id"], "response": result["response"],
+                            "status": result["status"], "usage": result["usage"]})
+        finally:
+            if lock:
+                lock.release()
+
+    def _chat_stream(self, message, cid):
+        self._headers(200, "text/event-stream")
+        alive = {"ok": True}
+
+        def send(obj):
+            try:
+                self._sse(obj)
+                return True
+            except OSError:
+                alive["ok"] = False
+                return False
+
+        def on_delta(text):
+            if not send({"type": "delta", "text": text}):
+                raise OSError("cliente desconectado")
+
+        def keepalive():
+            if client_gone(self.connection):
+                alive["ok"] = False
+                return False
+            try:
+                self.wfile.write(b": keepalive\n\n")
+                self.wfile.flush()
+                return True
+            except OSError:
+                alive["ok"] = False
+                return False
+
+        try:
+            result = run_chat_turn(message, cid, self.request_id,
+                                   lambda c: send({"type": "conversation", "conversation_id": c}),
+                                   on_delta,
+                                   lambda: not alive["ok"] or client_gone(self.connection),
+                                   keepalive)
+            index_touch(result["conversation_id"])
+            send({"type": "done", "conversation_id": result["conversation_id"],
+                  "response": result["response"], "status": result["status"], "usage": result["usage"]})
+        except BridgeError as err:
+            log("stream_error", self.request_id, code=err.code)
+            send({"type": "error", "code": err.code, "message": err.message})
+        try:
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except OSError:
+            pass
 
     def _show_body(self):
         return {"license": "", "modelfile": "FROM " + CONFIG["model_name"], "parameters": "",
@@ -722,7 +1004,9 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             if path in ("/v1/chat/completions", "/chat/completions") and CONFIG["dump_requests"]:
                 self._dump(raw)
 
-            if path == "/api/generate":
+            if path == "/chat":
+                self._guarded(lambda: self._chat(payload))
+            elif path == "/api/generate":
                 self._guarded(lambda: self._ollama_generate(payload))
             elif path == "/api/chat":
                 self._guarded(lambda: self._ollama_chat(payload))

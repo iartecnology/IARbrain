@@ -28,14 +28,47 @@ agy  (Antigravity CLI, sesion OAuth en AGY_HOME)
 - **Metricas** Prometheus en `/metrics` y **health** en `/health` (con chequeos de `agy`, del home de `agy` y de auth reciente).
 - **Alertas** opcionales por Telegram cuando `agy` pierde la sesion o agota cuota.
 
+## Chat con memoria (como el chat de agy)
+
+`POST /chat` mantiene conversaciones reales de `agy`: el id lo asigna `agy` y cada turno
+se reanuda con `--conversation`, así que el agente recuerda lo anterior.
+
+```bash
+# primer mensaje (sin conversation_id crea una conversacion nueva)
+curl -s -X POST http://HOST:11444/chat -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"message":"Recuerda el codigo PERRO-42"}'
+# -> {"conversation_id":"...", "response":"...", "status":"SUCCESS", "usage":{...}}
+
+# siguientes mensajes en la misma conversacion
+curl -s -X POST http://HOST:11444/chat -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"conversation_id":"<id>","message":"Cual era el codigo?"}'
+
+# streaming SSE: eventos conversation, delta (texto), done, error; y [DONE]
+curl -N -X POST http://HOST:11444/chat -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"message":"hola","stream":true}'
+
+GET    /chat/conversations                 # lista (id, turns, created, last_used)
+DELETE /chat/conversations/<id>            # olvida la conversacion
+```
+
+Reglas:
+- Los mensajes que empiezan por `/` se rechazan (`slash_commands_disabled`): podrian cambiar modo o permisos de la sesion.
+- Un turno por conversacion a la vez (`409 conversation_busy`).
+- `CHAT_MODE=plan` (por defecto): `agy` **planifica pero no ejecuta** comandos ni escribe archivos; propone un plan y espera confirmacion. Es un control del modo de `agy`, no un sandbox: tratalo como salvaguarda y no como garantia.
+- `CHAT_MODE=default`: `agy` ejecuta comandos y escribe archivos sin pedir permiso en esta sesion (verificado: ejecuto `uname -a` sin `--dangerously-skip-permissions`). Solo activalo si el token esta bien protegido.
+- Las conversaciones del indice no se borran con la retencion; se borran con `DELETE`.
+- Cada turno consume ~8-12K tokens de contexto base de `agy`, incluso para respuestas cortas.
+
 ## Endpoints
 
 | Metodo | Ruta | Auth | Uso |
 |---|---|---|---|
 | GET | `/health` | no | Estado: `ok` o `degraded` (503). `?deep=1` hace una llamada real a `agy` (requiere auth). |
 | GET | `/metrics` | no | Metricas Prometheus. |
-| POST | `/v1/chat/completions`, `/chat/completions` | si | Chat OpenAI, con o sin `tools`, con o sin `stream`. |
-| POST | `/api/chat`, `/api/generate` | si | Equivalentes Ollama. |
+| POST | `/chat` | si | Chat con memoria por conversacion (ver arriba). |
+| GET / DELETE | `/chat/conversations[/<id>]` | si | Listar y olvidar conversaciones. |
+| POST | `/v1/chat/completions`, `/chat/completions` | si | Chat OpenAI sin memoria (el cliente manda el historial), con o sin `tools`, con o sin `stream`. |
+| POST | `/api/chat`, `/api/generate` | si | Equivalentes Ollama sin memoria. |
 | GET | `/api/tags`, `/api/ps`, `/v1/models`, `/models`, `/api/version` | si | Listado de modelos. |
 | POST | `/api/show` | si | Metadatos del modelo. |
 

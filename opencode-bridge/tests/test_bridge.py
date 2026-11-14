@@ -1,6 +1,7 @@
 """Pruebas del puente con un agy falso. Ejecutar: python3 -m unittest discover -s tests -v"""
 import json
 import os
+import re
 import socketserver
 import stat
 import sys
@@ -17,14 +18,33 @@ sys.path.insert(0, ROOT)
 import server  # noqa: E402
 
 FAKE_AGY = r'''#!/usr/bin/env python3
-import json, os, sys, time
+import json, os, sys, time, uuid
+argv = sys.argv
 mode = os.environ.get("FAKE_AGY_MODE", "answer")
 line = sys.stdin.readline()
-if "--json-schema" not in sys.argv and mode not in ("text", "noresult", "hang", "auth", "quota"):
-    pass
-def emit(result):
-    print(json.dumps({"event": "result", "result": result}), flush=True)
+try:
+    user_text = json.loads(line)["message"]["content"]
+except Exception:
+    user_text = ""
+if "--conversation" in argv:
+    cid = argv[argv.index("--conversation") + 1]
+else:
+    cid = str(uuid.uuid4())
 usage = {"input_tokens": 11, "output_tokens": 7, "total_tokens": 18}
+
+def emit(result):
+    print(json.dumps({"event": "init", "conversation_id": cid, "init": {"cwd": "/app"}}), flush=True)
+    text = result.get("response") or ""
+    if text:
+        half = max(1, len(text) // 2)
+        for piece in (text[:half], text[half:]):
+            if piece:
+                print(json.dumps({"event": "step_update", "step_update": {
+                    "conversation_id": cid, "step_type": "agent_response", "state": "ACTIVE",
+                    "text_delta": piece}}), flush=True)
+    result = dict(result, conversation_id=cid)
+    print(json.dumps({"event": "result", "result": result}), flush=True)
+
 if mode == "hang":
     time.sleep(60)
 elif mode == "noresult":
@@ -35,6 +55,8 @@ elif mode == "quota":
     emit({"status": "ERROR", "error": "You have exhausted your quota on this model.", "usage": usage})
 elif mode == "text":
     emit({"status": "SUCCESS", "response": "texto libre", "usage": usage})
+elif mode == "echo":
+    emit({"status": "SUCCESS", "response": "eco: " + user_text, "usage": usage})
 elif mode == "tool":
     emit({"status": "SUCCESS", "response": "", "usage": usage,
           "structured_output": {"action": "tool_call", "tool": "get_account", "arguments": {"id": "abc"}}})
@@ -59,6 +81,7 @@ else:
 TOOLS = [{"type": "function", "function": {
     "name": "get_account", "description": "cuenta",
     "parameters": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}}}]
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
 class BridgeTest(unittest.TestCase):
@@ -76,6 +99,7 @@ class BridgeTest(unittest.TestCase):
             "max_concurrency": 2, "decision_retries": 1, "retention_days": 0,
             "agy_home": cls.dir, "state_dir": cls.dir, "log_format": "text",
             "max_prompt_chars": 300000, "telegram_token": None, "telegram_chat_id": None,
+            "chat_mode": "plan",
         })
         server.GATE = threading.BoundedSemaphore(server.CONFIG["max_concurrency"])
         cls.httpd = socketserver.ThreadingTCPServer(("127.0.0.1", 0), server.BridgeHandler)
@@ -96,7 +120,11 @@ class BridgeTest(unittest.TestCase):
         os.environ["FAKE_AGY_COUNTER"] = counter
         server.CONFIG["agy_timeout"] = 3
         server.CONFIG["decision_retries"] = 1
+        server.CONFIG["chat_mode"] = "plan"
         server.GATE = threading.BoundedSemaphore(server.CONFIG["max_concurrency"])
+        index = os.path.join(self.dir, "conversations.json")
+        if os.path.exists(index):
+            os.remove(index)
 
     def request(self, path, body=None, token=None, method=None):
         url = "http://127.0.0.1:%d%s" % (self.port, path)
@@ -122,6 +150,14 @@ class BridgeTest(unittest.TestCase):
         body.update(extra)
         return self.request("/v1/chat/completions", body, token=self.token)
 
+    def stream_post(self, path, body):
+        url = "http://127.0.0.1:%d%s" % (self.port, path)
+        req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Authorization", "Bearer " + self.token)
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return resp.read().decode("utf-8")
+
     # auth
     def test_rejects_missing_token(self):
         status, body, _ = self.request("/v1/chat/completions",
@@ -137,11 +173,12 @@ class BridgeTest(unittest.TestCase):
         status, body, _ = self.request("/health")
         self.assertIn(status, (200, 503))
         self.assertIn("checks", body)
+        self.assertEqual(body["chat"]["mode"], "plan")
         status, text, _ = self.request("/metrics")
         self.assertEqual(status, 200)
         self.assertIn("bridge_http_requests_total", text)
 
-    # texto libre
+    # texto libre / OpenAI
     def test_plain_answer(self):
         status, body, _ = self.chat()
         self.assertEqual(status, 200)
@@ -153,7 +190,6 @@ class BridgeTest(unittest.TestCase):
         status, body, _ = self.chat()
         self.assertEqual(body["choices"][0]["message"]["content"], "texto libre")
 
-    # tool calling
     def test_valid_tool_call(self):
         os.environ["FAKE_AGY_MODE"] = "tool"
         status, body, _ = self.chat(tools=TOOLS)
@@ -178,15 +214,84 @@ class BridgeTest(unittest.TestCase):
 
     def test_streaming_tool_call(self):
         os.environ["FAKE_AGY_MODE"] = "tool"
-        url = "http://127.0.0.1:%d/v1/chat/completions" % self.port
-        body = {"messages": [{"role": "user", "content": "x"}], "tools": TOOLS, "stream": True}
-        req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
-        req.add_header("Content-Type", "application/json")
-        req.add_header("Authorization", "Bearer " + self.token)
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            text = resp.read().decode("utf-8")
+        text = self.stream_post("/v1/chat/completions",
+                                {"messages": [{"role": "user", "content": "x"}], "tools": TOOLS, "stream": True})
         self.assertIn('"tool_calls"', text)
         self.assertIn("[DONE]", text)
+
+    # chat de sesion (como el chat de agy)
+    def test_chat_new_conversation(self):
+        status, body, _ = self.request("/chat", {"message": "hola"}, token=self.token)
+        self.assertEqual(status, 200)
+        self.assertRegex(body["conversation_id"], UUID_RE)
+        self.assertEqual(body["response"], "hola")
+
+    def test_chat_resume_keeps_id_and_counts_turns(self):
+        os.environ["FAKE_AGY_MODE"] = "echo"
+        _, first, _ = self.request("/chat", {"message": "uno"}, token=self.token)
+        cid = first["conversation_id"]
+        status, second, _ = self.request("/chat", {"message": "dos", "conversation_id": cid}, token=self.token)
+        self.assertEqual(status, 200)
+        self.assertEqual(second["conversation_id"], cid)
+        self.assertEqual(second["response"], "eco: dos")
+        status, listing, _ = self.request("/chat/conversations", token=self.token)
+        entry = [c for c in listing["conversations"] if c["id"] == cid][0]
+        self.assertEqual(entry["turns"], 2)
+
+    def test_chat_unknown_conversation_404(self):
+        status, body, _ = self.request("/chat", {"message": "x", "conversation_id":
+                                                 "00000000-0000-0000-0000-000000000000"}, token=self.token)
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["type"], "conversation_not_found")
+
+    def test_chat_invalid_conversation_id_400(self):
+        status, body, _ = self.request("/chat", {"message": "x", "conversation_id": "../../etc"},
+                                       token=self.token)
+        self.assertEqual(status, 400)
+
+    def test_chat_rejects_slash_commands(self):
+        status, body, _ = self.request("/chat", {"message": "/mode auto"}, token=self.token)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["type"], "slash_commands_disabled")
+
+    def test_chat_requires_message(self):
+        status, _, _ = self.request("/chat", {"message": "   "}, token=self.token)
+        self.assertEqual(status, 400)
+
+    def test_chat_stream_emits_deltas_and_done(self):
+        os.environ["FAKE_AGY_MODE"] = "echo"
+        text = self.stream_post("/chat", {"message": "stream", "stream": True})
+        self.assertIn('"type": "conversation"', text)
+        self.assertIn('"type": "delta"', text)
+        self.assertIn('"type": "done"', text)
+        self.assertIn("[DONE]", text)
+
+    def test_chat_delete_then_gone(self):
+        _, first, _ = self.request("/chat", {"message": "uno"}, token=self.token)
+        cid = first["conversation_id"]
+        status, _, _ = self.request("/chat/conversations/" + cid, token=self.token, method="DELETE")
+        self.assertEqual(status, 200)
+        status, body, _ = self.request("/chat/conversations/" + cid, token=self.token, method="DELETE")
+        self.assertEqual(status, 404)
+
+    def test_chat_busy_conversation_409(self):
+        _, first, _ = self.request("/chat", {"message": "uno"}, token=self.token)
+        cid = first["conversation_id"]
+        os.environ["FAKE_AGY_MODE"] = "hang"
+        server.CONFIG["agy_timeout"] = 4
+        result = {}
+
+        def slow():
+            result["first"] = self.request("/chat", {"message": "lento", "conversation_id": cid},
+                                           token=self.token)
+
+        worker = threading.Thread(target=slow)
+        worker.start()
+        time.sleep(0.5)
+        status, body, _ = self.request("/chat", {"message": "otro", "conversation_id": cid}, token=self.token)
+        worker.join(30)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["type"], "conversation_busy")
 
     # errores
     def test_auth_error_maps_to_503(self):
