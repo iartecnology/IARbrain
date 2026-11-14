@@ -12,6 +12,7 @@ services:
     volumes:
       - agy-home:/root/.gemini
       - bridge-state:/state
+      - opencode-data:/var/lib/ocdata
     tmpfs:
       - /tmp
       - /root/.cache
@@ -26,3 +27,4 @@ services:
 volumes:
   agy-home:
   bridge-state:
+  opencode-data:

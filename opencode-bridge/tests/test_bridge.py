@@ -78,6 +78,31 @@ else:
           "structured_output": {"action": "answer", "content": "hola"}})
 '''
 
+FAKE_OPENCODE = r'''#!/usr/bin/env python3
+import json, random, string, sys, time
+argv = sys.argv[1:]
+message = argv[-1]
+if "--session" in argv:
+    sid = argv[argv.index("--session") + 1]
+else:
+    sid = "ses_" + "".join(random.choice(string.ascii_letters + string.digits) for _ in range(20))
+
+def ev(obj):
+    print(json.dumps(obj), flush=True)
+
+if "[[hang]]" in message:
+    time.sleep(60)
+if "[[quota]]" in message:
+    ev({"type": "step_start", "sessionID": sid, "part": {"type": "step-start"}})
+    ev({"type": "error", "sessionID": sid, "error": {"type": "provider.free-limit", "status": 429,
+        "message": "Free usage limit reached.", "retryAfterMs": 120000}})
+    sys.exit(0)
+text = ("eco: " + message) if "[[echo]]" in message else "hola desde opencode"
+ev({"type": "step_start", "sessionID": sid, "part": {"type": "step-start"}})
+ev({"type": "text", "sessionID": sid, "part": {"type": "text", "text": text}})
+ev({"type": "step_finish", "sessionID": sid, "part": {"type": "step-finish", "tokens": {"input": 7, "output": 3}}})
+'''
+
 TOOLS = [{"type": "function", "function": {
     "name": "get_account", "description": "cuenta",
     "parameters": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}}}]
@@ -94,12 +119,19 @@ class BridgeTest(unittest.TestCase):
         with open(cls.agy, "w") as fh:
             fh.write(FAKE_AGY)
         os.chmod(cls.agy, os.stat(cls.agy).st_mode | stat.S_IEXEC)
+        cls.oc = os.path.join(cls.dir, "opencode")
+        with open(cls.oc, "w") as fh:
+            fh.write(FAKE_OPENCODE)
+        os.chmod(cls.oc, os.stat(cls.oc).st_mode | stat.S_IEXEC)
         server.CONFIG.update({
             "agy_bin": cls.agy, "bridge_token": cls.token, "agy_timeout": 3,
             "max_concurrency": 2, "decision_retries": 1, "retention_days": 0,
             "agy_home": cls.dir, "state_dir": cls.dir, "log_format": "text",
             "max_prompt_chars": 300000, "telegram_token": None, "telegram_chat_id": None,
             "chat_mode": "plan",
+            "opencode_enabled": True, "opencode_bin": cls.oc, "opencode_timeout": 3,
+            "opencode_model": "opencode/big-pickle", "opencode_uid": 0, "opencode_home": cls.dir,
+            "opencode_max_chars": 100000,
         })
         server.GATE = threading.BoundedSemaphore(server.CONFIG["max_concurrency"])
         cls.httpd = socketserver.ThreadingTCPServer(("127.0.0.1", 0), server.BridgeHandler)
@@ -292,6 +324,89 @@ class BridgeTest(unittest.TestCase):
         worker.join(30)
         self.assertEqual(status, 409)
         self.assertEqual(body["error"]["type"], "conversation_busy")
+
+    # OpenCode como segundo modelo del mismo puerto
+    def test_models_lists_both(self):
+        status, body, _ = self.request("/v1/models", token=self.token)
+        ids = [m["id"] for m in body["data"]]
+        self.assertEqual(ids, ["antigravity-session", "opencode/big-pickle"])
+
+    def test_models_hides_opencode_when_disabled(self):
+        server.CONFIG["opencode_enabled"] = False
+        try:
+            _, body, _ = self.request("/v1/models", token=self.token)
+        finally:
+            server.CONFIG["opencode_enabled"] = True
+        self.assertEqual([m["id"] for m in body["data"]], ["antigravity-session"])
+
+    def test_openai_opencode_model_answer(self):
+        status, body, _ = self.request("/v1/chat/completions",
+                                       {"model": "opencode/big-pickle",
+                                        "messages": [{"role": "user", "content": "hola"}]}, token=self.token)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["model"], "opencode/big-pickle")
+        self.assertEqual(body["choices"][0]["message"]["content"], "hola desde opencode")
+        self.assertEqual(body["usage"]["prompt_tokens"], 7)
+
+    def test_openai_opencode_stream(self):
+        text = self.stream_post("/v1/chat/completions",
+                                {"model": "opencode/big-pickle", "stream": True,
+                                 "messages": [{"role": "user", "content": "[[echo]] x"}]})
+        self.assertIn('"content": "eco: ', text)
+        self.assertIn('"finish_reason": "stop"', text)
+        self.assertIn("[DONE]", text)
+
+    def test_openai_opencode_rejects_tools(self):
+        status, body, _ = self.request("/v1/chat/completions",
+                                       {"model": "opencode/big-pickle", "tools": TOOLS,
+                                        "messages": [{"role": "user", "content": "x"}]}, token=self.token)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["type"], "tools_not_supported")
+
+    def test_opencode_disabled_returns_404(self):
+        server.CONFIG["opencode_enabled"] = False
+        try:
+            status, body, _ = self.request("/v1/chat/completions",
+                                           {"model": "opencode/big-pickle",
+                                            "messages": [{"role": "user", "content": "x"}]}, token=self.token)
+        finally:
+            server.CONFIG["opencode_enabled"] = True
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["type"], "model_not_available")
+
+    def test_opencode_quota_maps_429_with_retry(self):
+        status, body, headers = self.request("/v1/chat/completions",
+                                             {"model": "opencode/big-pickle",
+                                              "messages": [{"role": "user", "content": "[[quota]]"}]},
+                                             token=self.token)
+        self.assertEqual(status, 429)
+        self.assertEqual(body["error"]["type"], "opencode_quota")
+        self.assertEqual(headers.get("Retry-After"), "120")
+
+    def test_chat_opencode_new_and_resume(self):
+        status, first, _ = self.request("/chat", {"model": "opencode/big-pickle", "message": "[[echo]] uno"},
+                                        token=self.token)
+        self.assertEqual(status, 200)
+        cid = first["conversation_id"]
+        self.assertTrue(cid.startswith("ses_"))
+        status, second, _ = self.request("/chat", {"model": "opencode/big-pickle", "conversation_id": cid,
+                                                   "message": "[[echo]] dos"}, token=self.token)
+        self.assertEqual(status, 200)
+        self.assertEqual(second["conversation_id"], cid)
+        self.assertEqual(second["response"], "eco: [[echo]] dos")
+
+    def test_chat_engine_mismatch_400(self):
+        _, agy_conv, _ = self.request("/chat", {"message": "hola"}, token=self.token)
+        status, body, _ = self.request("/chat", {"model": "opencode/big-pickle",
+                                                 "conversation_id": agy_conv["conversation_id"],
+                                                 "message": "x"}, token=self.token)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["type"], "engine_mismatch")
+
+    def test_opencode_message_starting_with_dash(self):
+        status, body, _ = self.request("/chat", {"model": "opencode/big-pickle", "message": "-x [[echo]]"},
+                                       token=self.token)
+        self.assertEqual(status, 200)
 
     # errores
     def test_auth_error_maps_to_503(self):

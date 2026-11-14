@@ -63,6 +63,16 @@ CONFIG = {
     "decision_retries": max(0, _env_int("DECISION_RETRIES", 1)),
     "skip_permissions": _env_bool("AGY_SKIP_PERMISSIONS", True),
     "chat_mode": os.environ.get("CHAT_MODE", "plan"),
+    "opencode_enabled": _env_bool("OPENCODE_ENABLED", False),
+    "opencode_bin": os.environ.get("OPENCODE_BIN", "opencode"),
+    "opencode_model": os.environ.get("OPENCODE_MODEL", "opencode/big-pickle"),
+    "opencode_timeout": _env_int("OPENCODE_TIMEOUT", 600),
+    "opencode_uid": _env_int("OPENCODE_UID", 0),
+    "opencode_home": os.environ.get("OPENCODE_HOME", "/var/lib/ocdata"),
+    "opencode_permission": os.environ.get(
+        "OPENCODE_PERMISSION",
+        '{"permission":{"bash":"deny","edit":"deny","write":"deny","webfetch":"deny"}}'),
+    "opencode_max_chars": _env_int("OPENCODE_MAX_CHARS", 100000),
     "retention_days": _env_int("AGY_RETENTION_DAYS", 7),
     "dump_requests": _env_bool("DEBUG_DUMP_REQUESTS", False),
     "state_dir": os.environ.get("STATE_DIR", "/state"),
@@ -353,9 +363,23 @@ def call_agy(prompt, schema=None, request_id="-", keepalive=None, cancelled=None
     }
 
 
-CONV_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+CONV_ID_RE = re.compile(
+    r"^(ses_[A-Za-z0-9]{6,64}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
 INDEX_LOCK = threading.Lock()
 CONV_LOCKS = {}
+
+
+def engine_for_model(model):
+    if model and model == CONFIG["opencode_model"]:
+        return "opencode"
+    return "agy"
+
+
+def model_names():
+    names = [CONFIG["model_name"]]
+    if CONFIG["opencode_enabled"]:
+        names.append(CONFIG["opencode_model"])
+    return names
 
 
 def _now():
@@ -383,10 +407,10 @@ def _index_save(data):
     os.replace(tmp, index_path())
 
 
-def index_touch(cid):
+def index_touch(cid, engine="agy"):
     with INDEX_LOCK:
         data = index_load()
-        entry = data.get(cid) or {"id": cid, "created": _now(), "turns": 0}
+        entry = data.get(cid) or {"id": cid, "created": _now(), "turns": 0, "engine": engine}
         entry["last_used"] = _now()
         entry["turns"] = int(entry.get("turns", 0)) + 1
         data[cid] = entry
@@ -401,6 +425,158 @@ def index_remove(cid):
         del data[cid]
         _index_save(data)
         return True
+
+
+def _wait_turn(proc, out_thread, timeout, cancelled, keepalive, request_id, label, started):
+    """Espera al proceso de un turno. Lanza BridgeError en timeout o cancelacion."""
+    deadline = started + timeout
+    outcome = None
+    last_keepalive = time.time()
+    while True:
+        try:
+            proc.wait(timeout=2)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        if cancelled():
+            outcome = "cancelled"
+            break
+        if time.time() > deadline:
+            outcome = "timeout"
+            break
+        if keepalive and time.time() - last_keepalive >= 5:
+            last_keepalive = time.time()
+            if not keepalive():
+                outcome = "cancelled"
+                break
+    if outcome:
+        _kill(proc)
+        out_thread.join(5)
+        METRICS.count(METRICS.agy, outcome)
+        log(label + "_" + outcome, request_id)
+        if outcome == "timeout":
+            raise BridgeError(504, label + "_timeout", "%s excedio el tiempo de espera." % label)
+        raise BridgeError(499, "client_closed", "cliente desconectado; turno cancelado.")
+    out_thread.join(10)
+
+
+def run_opencode_turn(message, session_id, request_id, on_init, on_delta, cancelled, keepalive=None):
+    """Un turno con OpenCode (`opencode run --format json`). Memoria por sesion (ses_...).
+
+    El proceso corre sin privilegios (OPENCODE_UID) y con entorno vacio: no hereda el token del puente
+    ni credenciales del contenedor. Los permisos de bash/edit/write/webfetch estan denegados.
+    """
+    if not CONFIG["opencode_enabled"]:
+        raise BridgeError(404, "model_not_available", "OpenCode no esta habilitado en este puente.")
+    if len(message) > CONFIG["opencode_max_chars"]:
+        raise BridgeError(413, "prompt_too_large", "mensaje demasiado largo para OpenCode (%d caracteres)."
+                          % CONFIG["opencode_max_chars"])
+    if message.startswith("-"):
+        message = " " + message
+    home = CONFIG["opencode_home"]
+    cmd = [CONFIG["opencode_bin"], "run", "-m", CONFIG["opencode_model"], "--format", "json"]
+    if session_id:
+        cmd += ["--session", session_id]
+    cmd.append(message)
+    if CONFIG["opencode_uid"]:
+        cmd = ["setpriv", "--reuid", str(CONFIG["opencode_uid"]), "--regid", str(CONFIG["opencode_uid"]),
+               "--clear-groups"] + cmd
+    env = {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "LANG": "C.UTF-8",
+        "HOME": home,
+        "XDG_DATA_HOME": home + "/data",
+        "XDG_STATE_HOME": home + "/state",
+        "XDG_CONFIG_HOME": home + "/config",
+        "XDG_CACHE_HOME": "/tmp/oc-cache",
+        "OPENCODE_CONFIG_CONTENT": CONFIG["opencode_permission"],
+    }
+    started = time.time()
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, encoding="utf-8", errors="replace", env=env, start_new_session=True)
+    except OSError as exc:
+        METRICS.count(METRICS.agy, "unavailable")
+        raise BridgeError(503, "opencode_unavailable", "no se pudo ejecutar opencode: %s" % exc)
+
+    state = {"cid": session_id, "texts": [], "error": None, "gone": False, "in": 0, "out": 0}
+
+    def send_init(cid):
+        if cid and not state.get("init_sent"):
+            state["init_sent"] = True
+            on_init(cid)
+
+    def reader():
+        for raw in proc.stdout:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                event = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            if event.get("sessionID") and not state["cid"]:
+                state["cid"] = event["sessionID"]
+                send_init(state["cid"])
+            kind = event.get("type")
+            part = event.get("part") or {}
+            if kind == "text" and part.get("text"):
+                state["texts"].append(part["text"])
+                if on_delta and not state["gone"]:
+                    try:
+                        on_delta(part["text"])
+                    except Exception:  # noqa: BLE001
+                        state["gone"] = True
+            elif kind == "step_finish":
+                tokens = part.get("tokens") or {}
+                state["in"] += int(tokens.get("input") or 0)
+                state["out"] += int(tokens.get("output") or 0)
+            elif kind == "error":
+                state["error"] = event.get("error") or {}
+
+    out_thread = threading.Thread(target=reader, daemon=True)
+    err_lines = []
+    err_thread = threading.Thread(target=lambda: err_lines.append(proc.stderr.read()), daemon=True)
+    out_thread.start()
+    err_thread.start()
+    send_init(session_id)
+    _wait_turn(proc, out_thread, CONFIG["opencode_timeout"], lambda: state["gone"] or cancelled(),
+               keepalive, request_id, "opencode", started)
+    err_thread.join(5)
+    METRICS.observe_agy(time.time() - started)
+
+    err = state["error"]
+    if err:
+        text = str(err.get("message") or err.get("type") or "error de OpenCode")
+        status = (err.get("status") or 0)
+        if err.get("type") == "provider.free-limit" or status == 429:
+            retry_ms = int(err.get("retryAfterMs") or 0)
+            retry = min(3600, max(1, retry_ms // 1000)) if retry_ms else 60
+            METRICS.count(METRICS.agy, "opencode_quota")
+            raise BridgeError(429, "opencode_quota", "OpenCode: " + text, retry_after=retry)
+        METRICS.count(METRICS.agy, "opencode_error")
+        raise BridgeError(502, "opencode_error", "OpenCode: " + text)
+    if not state["texts"]:
+        METRICS.count(METRICS.agy, "opencode_no_result")
+        raise BridgeError(502, "opencode_no_result", "OpenCode no devolvio texto. " + (err_lines[0][:300] if err_lines else ""))
+
+    cid = state["cid"]
+    send_init(cid)
+    usage = {"prompt_tokens": state["in"], "completion_tokens": state["out"],
+             "total_tokens": state["in"] + state["out"]}
+    METRICS.count(METRICS.agy, "SUCCESS")
+    METRICS.add_usage(usage)
+    log("opencode_done", request_id, session=cid, total_tokens=usage["total_tokens"])
+    return {"conversation_id": cid, "response": "\n".join(state["texts"]).strip(), "usage": usage,
+            "status": "SUCCESS"}
+
+
+def run_turn(engine, message, conversation_id, request_id, on_init, on_delta, cancelled, keepalive=None):
+    if engine == "opencode":
+        return run_opencode_turn(message, conversation_id, request_id, on_init, on_delta, cancelled, keepalive)
+    return run_chat_turn(message, conversation_id, request_id, on_init, on_delta, cancelled, keepalive)
 
 
 def run_chat_turn(message, conversation_id, request_id, on_init, on_delta, cancelled, keepalive=None):
@@ -471,36 +647,8 @@ def run_chat_turn(message, conversation_id, request_id, on_init, on_delta, cance
     err_thread.start()
     out_thread.start()
 
-    deadline = started + CONFIG["agy_timeout"]
-    outcome = None
-    last_keepalive = time.time()
-    while True:
-        try:
-            proc.wait(timeout=2)
-            break
-        except subprocess.TimeoutExpired:
-            pass
-        if state["gone"] or cancelled():
-            outcome = "cancelled"
-            break
-        if time.time() > deadline:
-            outcome = "timeout"
-            break
-        if keepalive and time.time() - last_keepalive >= 5:
-            last_keepalive = time.time()
-            if not keepalive():
-                outcome = "cancelled"
-                break
-    if outcome:
-        _kill(proc)
-        out_thread.join(5)
-        METRICS.count(METRICS.agy, outcome)
-        log("chat_" + outcome, request_id)
-        if outcome == "timeout":
-            raise BridgeError(504, "agy_timeout", "agy excedio el tiempo de espera.")
-        raise BridgeError(499, "client_closed", "cliente desconectado; turno de chat cancelado.")
-
-    out_thread.join(10)
+    _wait_turn(proc, out_thread, CONFIG["agy_timeout"], lambda: state["gone"] or cancelled(),
+               keepalive, request_id, "agy", started)
     err_thread.join(5)
     METRICS.observe_agy(time.time() - started)
     cid = state["cid"]
@@ -741,14 +889,15 @@ MODEL_ENTRY_DETAILS = {
 }
 
 
-def model_entry():
-    name = CONFIG["model_name"] + ":latest"
+def model_entry(model_id):
+    name = model_id + ":latest"
     return {"name": name, "model": name, "modified_at": "2026-11-07T00:00:00Z",
             "size": 7365960935, "digest": "sha256:1234567890abcdef", "details": MODEL_ENTRY_DETAILS}
 
 
-def openai_model_entry():
-    return {"id": CONFIG["model_name"], "object": "model", "created": 1700000000, "owned_by": "antigravity"}
+def openai_model_entry(model_id):
+    owner = "opencode" if model_id == CONFIG["opencode_model"] else "antigravity"
+    return {"id": model_id, "object": "model", "created": 1700000000, "owned_by": owner}
 
 
 class BridgeHandler(http.server.BaseHTTPRequestHandler):
@@ -846,9 +995,9 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                     self._json({"version": "0.1.32", "status": "ok", "model": CONFIG["model_name"],
                                 "tool_calling": True})
                 elif path in ("/api/tags", "/api/ps"):
-                    self._json({"models": [model_entry()]})
+                    self._json({"models": [model_entry(name) for name in model_names()]})
                 elif path in ("/v1/models", "/models"):
-                    self._json({"object": "list", "data": [openai_model_entry()]})
+                    self._json({"object": "list", "data": [openai_model_entry(name) for name in model_names()]})
                 elif path == "/api/show":
                     self._json(self._show_body())
                 else:
@@ -865,8 +1014,11 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             "recent_auth_error": (time.time() - METRICS.last_auth_error) < 600,
         }
         ok = checks["agy_present"] and checks["agy_home"] and not checks["recent_auth_error"]
+        checks["opencode"] = (not CONFIG["opencode_enabled"]) or os.path.isfile(CONFIG["opencode_bin"]) \
+            or shutil.which(CONFIG["opencode_bin"]) is not None
+        ok = ok and checks["opencode"]
         body = {"status": "ok" if ok else "degraded", "version": VERSION, "model": CONFIG["model_name"],
-                "tool_calling": True, "chat": {"mode": CONFIG["chat_mode"]},
+                "models": model_names(), "tool_calling": True, "chat": {"mode": CONFIG["chat_mode"]},
                 "checks": checks, "in_flight": METRICS.in_flight,
                 "max_concurrency": CONFIG["max_concurrency"]}
         query = self._query()
@@ -906,30 +1058,37 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
             raise BridgeError(400, "slash_commands_disabled",
                               "los comandos / no estan permitidos en el chat remoto")
         self._check_prompt(message)
+        engine = engine_for_model(payload.get("model"))
+        if engine == "opencode" and not CONFIG["opencode_enabled"]:
+            raise BridgeError(404, "model_not_available", "OpenCode no esta habilitado en este puente.")
         cid = payload.get("conversation_id")
         lock = None
         if cid is not None:
             if not isinstance(cid, str) or not CONV_ID_RE.match(cid):
                 raise BridgeError(400, "invalid_request", "conversation_id invalido")
-            if cid not in index_load():
+            entry = index_load().get(cid)
+            if entry is None:
                 raise BridgeError(404, "conversation_not_found", "conversacion no encontrada")
+            if entry.get("engine", "agy") != engine:
+                raise BridgeError(400, "engine_mismatch",
+                                  "la conversacion pertenece a otro modelo (%s)." % entry.get("engine", "agy"))
             lock = CONV_LOCKS.setdefault(cid, threading.Lock())
             if not lock.acquire(blocking=False):
                 raise BridgeError(409, "conversation_busy", "la conversacion tiene un turno en curso")
         try:
             if payload.get("stream"):
-                self._chat_stream(message, cid)
+                self._chat_stream(message, cid, engine)
             else:
-                result = run_chat_turn(message, cid, self.request_id, lambda c: None, None,
-                                       lambda: client_gone(self.connection))
-                index_touch(result["conversation_id"])
+                result = run_turn(engine, message, cid, self.request_id, lambda c: None, None,
+                                  lambda: client_gone(self.connection))
+                index_touch(result["conversation_id"], engine)
                 self._json({"conversation_id": result["conversation_id"], "response": result["response"],
                             "status": result["status"], "usage": result["usage"]})
         finally:
             if lock:
                 lock.release()
 
-    def _chat_stream(self, message, cid):
+    def _chat_stream(self, message, cid, engine="agy"):
         self._headers(200, "text/event-stream")
         alive = {"ok": True}
 
@@ -958,12 +1117,12 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                 return False
 
         try:
-            result = run_chat_turn(message, cid, self.request_id,
-                                   lambda c: send({"type": "conversation", "conversation_id": c}),
-                                   on_delta,
-                                   lambda: not alive["ok"] or client_gone(self.connection),
-                                   keepalive)
-            index_touch(result["conversation_id"])
+            result = run_turn(engine, message, cid, self.request_id,
+                              lambda c: send({"type": "conversation", "conversation_id": c}),
+                              on_delta,
+                              lambda: not alive["ok"] or client_gone(self.connection),
+                              keepalive)
+            index_touch(result["conversation_id"], engine)
             send({"type": "done", "conversation_id": result["conversation_id"],
                   "response": result["response"], "status": result["status"], "usage": result["usage"]})
         except BridgeError as err:
@@ -1073,6 +1232,9 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
                     "eval_count": result["usage"]["completion_tokens"]})
 
     def _openai_chat(self, payload):
+        if engine_for_model(payload.get("model")) == "opencode":
+            self._openai_opencode(payload)
+            return
         tools = [t for t in (payload.get("tools") or []) if isinstance(t, dict)]
         tool_choice = payload.get("tool_choice")
         use_tools = bool(tools) and tool_choice != "none"
@@ -1083,6 +1245,79 @@ class BridgeHandler(http.server.BaseHTTPRequestHandler):
         prompt = build_decision_prompt(tools, tool_choice, payload) if use_tools else build_transcript(payload)
         self._check_prompt(prompt)
         self._guarded(lambda: self._run_openai(payload, tools, tool_choice, use_tools, stream, created, rid))
+
+    def _openai_opencode(self, payload):
+        if not CONFIG["opencode_enabled"]:
+            raise BridgeError(404, "model_not_available", "OpenCode no esta habilitado en este puente.")
+        if [t for t in (payload.get("tools") or []) if isinstance(t, dict)] and payload.get("tool_choice") != "none":
+            raise BridgeError(400, "tools_not_supported",
+                              "el modelo %s no admite tools; usa %s." % (CONFIG["opencode_model"], CONFIG["model_name"]))
+        prompt = build_transcript(payload)
+        if len(prompt) > CONFIG["opencode_max_chars"]:
+            raise BridgeError(413, "prompt_too_large", "conversacion demasiado larga para OpenCode.")
+        stream = bool(payload.get("stream"))
+        created = int(time.time())
+        rid = "chatcmpl-%s" % self.request_id
+        model = payload.get("model") or CONFIG["opencode_model"]
+        self._guarded(lambda: self._run_openai_opencode(prompt, stream, created, rid, model))
+
+    def _run_openai_opencode(self, prompt, stream, created, rid, model):
+        if stream:
+            self._headers(200, "text/event-stream")
+            self._sse({"id": rid, "object": "chat.completion.chunk", "created": created, "model": model,
+                       "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
+        alive = {"ok": True}
+
+        def chunk(delta, finish=None, usage=None):
+            obj = {"id": rid, "object": "chat.completion.chunk", "created": created, "model": model,
+                   "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+            if usage:
+                obj["usage"] = usage
+            return obj
+
+        def on_delta(text):
+            try:
+                self._sse(chunk({"content": text}))
+            except OSError:
+                alive["ok"] = False
+                raise
+
+        def keepalive():
+            if client_gone(self.connection):
+                alive["ok"] = False
+                return False
+            try:
+                self.wfile.write(b": keepalive\n\n")
+                self.wfile.flush()
+                return True
+            except OSError:
+                alive["ok"] = False
+                return False
+
+        try:
+            result = run_opencode_turn(prompt, None, self.request_id, lambda c: None,
+                                       on_delta if stream else None,
+                                       lambda: not alive["ok"] or client_gone(self.connection),
+                                       keepalive if stream else None)
+        except BridgeError as err:
+            if not stream:
+                raise
+            self._sse({"error": {"message": err.message, "type": err.code, "code": err.code}})
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+            return
+        usage = {"prompt_tokens": result["usage"]["prompt_tokens"],
+                 "completion_tokens": result["usage"]["completion_tokens"],
+                 "total_tokens": result["usage"]["total_tokens"]}
+        if stream:
+            self._sse(chunk({}, finish="stop", usage=usage))
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+            return
+        self._json({"id": rid, "object": "chat.completion", "created": created, "model": model,
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": result["response"]},
+                                 "finish_reason": "stop"}],
+                    "usage": usage})
 
     def _run_openai(self, payload, tools, tool_choice, use_tools, stream, created, rid):
         if stream:
